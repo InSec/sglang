@@ -10,6 +10,7 @@ from sglang.srt.dllm.mixin.scheduler import DllmManager
 from sglang.srt.mem_cache import allocation
 from sglang.srt.mem_cache.allocation import alloc_for_extend
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -118,15 +119,15 @@ class TestDllmFdfoKvReuse(unittest.TestCase):
             size=8, max_context_len=64, device="cpu", enable_memory_saver=False
         )
         self._old_support_triton = allocation.support_triton
-        self._old_get_server_args = allocation.get_server_args
         allocation.support_triton = lambda _: False
-        allocation.get_server_args = lambda: SimpleNamespace(
+        override = get_context().override_server_args(
             attention_backend="torch_native", dcp_size=1
         )
+        override.install()
+        self.addCleanup(override.restore)
 
     def tearDown(self):
         allocation.support_triton = self._old_support_triton
-        allocation.get_server_args = self._old_get_server_args
 
     def test_alloc_for_extend_mixed_reuse_allocates_only_fresh_and_writes_rows(self):
         allocator = _FakeAllocator(base=200)
