@@ -341,6 +341,13 @@ class InputFormat(Enum):
     CROSS_ENCODER_PAIRS = 3  # Cross-encoder pairs like [["query", "document"]]
 
 
+_SERVER_ARGS_FIELDS = frozenset(f.name for f in dataclasses.fields(ServerArgs))
+
+# Live on the manager itself (operational code reads the attributes), so both
+# readback shapes take them from there rather than from the update log.
+_MANAGER_OWNED_FIELDS = ("model_path", "served_model_name")
+
+
 class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     """TokenizerManager is a process that tokenizes the text."""
 
@@ -363,6 +370,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     ):
         # Parse args
         self.server_args = server_args
+        self._config_updates: List[Tuple[str, Dict[str, Any]]] = []
         self.elastic_worker_count = server_args.dp_size
         self.elastic_pending_ep_size = None
         self.elastic_scale_phase = "idle"
@@ -1847,9 +1855,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     ) -> Tuple[bool, str]:
         self.auto_create_handle_loop()
 
-        # default the load format to the server_args
         if obj.load_format is None:
-            obj.load_format = self.server_args.load_format
+            obj.load_format = self.config_value("load_format")
         logger.info("Start update_weights. Load format=%s", obj.load_format)
 
         if obj.abort_all_requests:
@@ -1873,11 +1880,45 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         return success, message, num_paused_requests
 
+    def record_config_updates(self, source: str, **fields) -> None:
+        """Record a control-plane config change for this engine.
+
+        Per-engine state: several ``Engine``s can share one tokenizer process.
+        The readback endpoints overlay these onto the startup config. The
+        process-global sibling is ``RuntimeContext.override`` /
+        ``resolved_server_args_dict``, which writes the config bags every
+        process shares.
+        """
+        unknown = sorted(f for f in fields if f not in _SERVER_ARGS_FIELDS)
+        if unknown:
+            raise ValueError(
+                f"{unknown} are not ServerArgs fields; the readback endpoints "
+                "overlay these onto a serialized ServerArgs, so an unknown key "
+                "would surface as a phantom config entry."
+            )
+        self._config_updates.append((source, dict(fields)))
+
+    def config_value(self, name: str):
+        """The value in effect for one config field, control-plane updates first."""
+        if name in _MANAGER_OWNED_FIELDS:
+            return getattr(self, name)
+        for _source, fields in reversed(self._config_updates):
+            if name in fields:
+                return fields[name]
+        return getattr(self.server_args, name)
+
+    def resolved_config_dict(self, base: Dict[str, Any]) -> Dict[str, Any]:
+        """``base`` (a serialized ``ServerArgs``) with the control-plane updates on top."""
+        resolved = dict(base)
+        for _source, fields in self._config_updates:
+            resolved.update(fields)
+        for name in _MANAGER_OWNED_FIELDS:
+            resolved[name] = getattr(self, name)
+        return resolved
+
     def _update_model_path_info(self, model_path: str, load_format: str):
         self.served_model_name = model_path
-        self.server_args.override(
-            "tokenizer.update_weights", model_path=model_path, load_format=load_format
-        )
+        self.record_config_updates("tokenizer.update_weights", load_format=load_format)
         self.model_path = model_path
 
     async def _wait_for_model_update_from_disk(
@@ -2019,7 +2060,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 "id": rid,
                 "finish_reason": recv_obj.finished_reasons[i],
                 "prompt_tokens": recv_obj.prompt_tokens[i],
-                "weight_version": self.server_args.weight_version,
+                "weight_version": self.config_value("weight_version"),
                 "num_retractions": recv_obj.retraction_counts[i],
             }
 
@@ -2958,7 +2999,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         meta_info = {
             "id": recv_obj.rid,
             "finish_reason": finish_reason,
-            "weight_version": self.server_args.weight_version,
+            "weight_version": self.config_value("weight_version"),
             "e2e_latency": state.time_stats.get_e2e_latency(),
         }
         is_stream = getattr(state.obj, "stream", False)
